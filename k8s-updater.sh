@@ -19,16 +19,27 @@ CONTAINER="${CONTAINER:-}"                  # empty = containers whose image rep
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-600}"   # seconds to wait for each rollout
 POLL_INTERVAL="${POLL_INTERVAL:-3}"         # seconds between progress checks
 LOG_ROOT="${LOG_ROOT:-$(cd "$(dirname "$0")" && pwd)/logs}"
+ARGOCD_CONTEXT="${ARGOCD_CONTEXT:-}"        # context of the cluster running ArgoCD; empty = KUBE_CONTEXT
+ARGOCD_NAMESPACE="${ARGOCD_NAMESPACE:-argocd}"
+ARGOCD_APP="${ARGOCD_APP:-}"                # empty = detect the Application from the deployment
+AUTOSYNC_VERIFY_SECONDS="${AUTOSYNC_VERIFY_SECONDS:-10}"  # watch for something reverting the toggle
+
+APP_RESOURCE="applications.argoproj.io"
+# Annotation on the Application that keeps the automated settings while autosync is off
+BACKUP_KEY="k8s-updater/autosync-backup"
 
 # Contexts matching this pattern are treated as production (stricter confirmation)
 PROD_CONTEXT_PATTERN='(^|[-_/.])(prd|prod|production)([-_/.]|$)'
 # Pod waiting reasons that will not fix themselves
 FATAL_WAIT_REASONS='ImagePullBackOff ErrImagePull InvalidImageName CrashLoopBackOff CreateContainerConfigError CreateContainerError'
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="$(basename "$0")"
 
 COMMAND=""
+AUTOSYNC_ACTION=""
+AUTOSYNC_APPS=""   # "app-namespace/app" entries found by autosync_report
+AUTOSYNC_DESTS=""  # "app-namespace/app=destination-cluster" entries
 DRY_RUN=0
 ASSUME_YES=0
 ALL=0
@@ -78,20 +89,26 @@ log_block() {
 
 # kubectl, always pinned to the chosen context
 k() { kubectl --context "$KUBE_CONTEXT" "$@"; }
+# kubectl for the cluster that runs ArgoCD (may differ from the workload cluster)
+ka() { kubectl --context "$ARGOCD_CONTEXT" --request-timeout=20s "$@"; }
 
 # Run a mutating kubectl command: echo it, log it, honour --dry-run
-k_change() {
-  local cmd_text="kubectl --context $KUBE_CONTEXT $*"
+k_change()  { run_change "$KUBE_CONTEXT" "$@"; }
+ka_change() { run_change "$ARGOCD_CONTEXT" "$@"; }
+
+run_change() {  # run_change context kubectl-args...
+  local ctx=$1; shift
+  local cmd_text="kubectl --context $ctx $*"
   local out rc=0
   if [[ $DRY_RUN -eq 1 ]]; then
     cmd_text="$cmd_text --dry-run=server"
     printf '%s$ %s%s\n' "$C_DIM" "$cmd_text" "$C_RESET"
     [[ -n "$LOG_FILE" ]] && printf '%s $ %s\n' "$(ts)" "$cmd_text" >> "$LOG_FILE"
-    out=$(k "$@" --dry-run=server 2>&1) || rc=$?
+    out=$(kubectl --context "$ctx" "$@" --dry-run=server 2>&1) || rc=$?
   else
     printf '%s$ %s%s\n' "$C_DIM" "$cmd_text" "$C_RESET"
     [[ -n "$LOG_FILE" ]] && printf '%s $ %s\n' "$(ts)" "$cmd_text" >> "$LOG_FILE"
-    out=$(k "$@" 2>&1) || rc=$?
+    out=$(kubectl --context "$ctx" "$@" 2>&1) || rc=$?
   fi
   log_block "$out"
   return $rc
@@ -110,12 +127,16 @@ Usage:
   $SCRIPT_NAME status   -n NS [-c CTX]
   $SCRIPT_NAME set-image -n NS -i IMAGE (-d DEPLOY ... | --all) [-C CONTAINER] [--dry-run]
   $SCRIPT_NAME restart  -n NS (-d DEPLOY ... | --all) [--dry-run]
+  $SCRIPT_NAME autosync [status|on|off] --argocd-context CTX -n NS [-d DEPLOY ... | --all] [--dry-run]
+  $SCRIPT_NAME autosync [status|on|off] --argocd-context CTX --app APP
 
 Commands:
   session      Show which cluster/user you are on and check access (read-only)
   status       List deployments, readiness and images in a namespace (read-only)
   set-image    Replace a container image (tag or digest) and wait for the rollout
   restart      Rollout-restart deployments one by one and wait for each
+  autosync     Show the ArgoCD autosync state of the Applications that deploy to NS
+               (default: status), or turn it on/off. Talks only to the ArgoCD cluster
   menu         Interactive menu (default when no command is given)
 
 Options:
@@ -132,18 +153,23 @@ Options:
                           type the namespace)
       --timeout SEC       rollout wait per deployment (default: $ROLLOUT_TIMEOUT)
       --log-dir DIR       where run folders are written (default: ./logs)
+      --argocd-context CTX    context of the cluster running ArgoCD (autosync; default: --context)
+      --argocd-namespace NS   namespace of the ArgoCD Applications (default: $ARGOCD_NAMESPACE)
+      --app NAME          ArgoCD Application to use instead of detecting it from the deployment
   -h, --help              this help
 
 Environment variables: TARGET_IMAGE, KUBE_CONTEXT, NAMESPACE, CONTAINER, ROLLOUT_TIMEOUT,
-POLL_INTERVAL, LOG_ROOT.
+POLL_INTERVAL, LOG_ROOT, ARGOCD_CONTEXT, ARGOCD_NAMESPACE, ARGOCD_APP, AUTOSYNC_VERIFY_SECONDS.
 
 Examples:
   $SCRIPT_NAME session
-  $SCRIPT_NAME status -n lms-collection
-  $SCRIPT_NAME set-image -n lms-collection -d lms-collection-web-production \\
-      -i 097159463413.dkr.ecr.ap-southeast-3.amazonaws.com/ffi-krdv-te-lms-collection:web-v0.0.105 --dry-run
+  $SCRIPT_NAME status -n my-ns
+  $SCRIPT_NAME set-image -n my-ns -d my-deploy \\
+      -i 123456789012.dkr.ecr.ap-southeast-3.amazonaws.com/my-repo:v1.2.3 --dry-run
   TARGET_IMAGE=repo/app@sha256:abc... $SCRIPT_NAME set-image -n my-ns --all
   $SCRIPT_NAME restart -n my-ns -d api -d worker
+  $SCRIPT_NAME autosync --argocd-context my-argocd-ctx -n my-ns
+  $SCRIPT_NAME autosync off --argocd-context my-argocd-ctx -n my-ns -d my-deploy --dry-run
 EOF
 }
 
@@ -179,12 +205,12 @@ validate_image() {
   fi
 }
 
-confirm() {  # confirm "question"
-  local question=$1 answer
+confirm() {  # confirm "question" [word to type in production, default: the namespace]
+  local question=$1 word=${2:-$NAMESPACE} answer
   if [[ $IS_PROD -eq 1 ]]; then
-    printf '%s%sPRODUCTION%s context %s%s%s.\n' "$C_RED" "$C_BOLD" "$C_RESET" "$C_BOLD" "$KUBE_CONTEXT" "$C_RESET"
-    read -r -p "$question Type the namespace '$NAMESPACE' to confirm: " answer
-    [[ "$answer" == "$NAMESPACE" ]] || { warn "Confirmation did not match. Nothing changed."; return 1; }
+    printf '%s%sPRODUCTION%s target (context %s%s%s).\n' "$C_RED" "$C_BOLD" "$C_RESET" "$C_BOLD" "$KUBE_CONTEXT" "$C_RESET"
+    read -r -p "$question Type '$word' to confirm: " answer
+    [[ "$answer" == "$word" ]] || { warn "Confirmation did not match. Nothing changed."; return 1; }
   elif [[ $ASSUME_YES -eq 1 ]]; then
     info "$question --yes given, continuing."
   else
@@ -233,9 +259,14 @@ resolve_context() {
   if [[ -z "$KUBE_CONTEXT" ]]; then
     KUBE_CONTEXT=$(kubectl config current-context 2>/dev/null) || die "No current kubectl context. Pass -c/--context."
   fi
-  kubectl config get-contexts -o name 2>/dev/null | grep -qx -- "$KUBE_CONTEXT" \
+  kubectl config get-contexts -o name 2>/dev/null | grep -x -- "$KUBE_CONTEXT" >/dev/null \
     || die "Context '$KUBE_CONTEXT' not found in kubeconfig."
   if printf '%s' "$KUBE_CONTEXT" | grep -Eqi "$PROD_CONTEXT_PATTERN"; then IS_PROD=1; else IS_PROD=0; fi
+  ARGOCD_CONTEXT=${ARGOCD_CONTEXT:-$KUBE_CONTEXT}
+  if [[ "$ARGOCD_CONTEXT" != "$KUBE_CONTEXT" ]]; then
+    kubectl config get-contexts -o name 2>/dev/null | grep -x -- "$ARGOCD_CONTEXT" >/dev/null \
+      || die "ArgoCD context '$ARGOCD_CONTEXT' not found in kubeconfig."
+  fi
 }
 
 check_session() {
@@ -299,11 +330,283 @@ pick_deployments() {  # interactive: fill DEPLOYMENTS or set ALL=1
 }
 
 argocd_warning() {  # argocd_warning deploy
-  local marks
-  marks=$(k -n "$NAMESPACE" get deploy "$1" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{.metadata.labels.argocd\.argoproj\.io/instance}{.metadata.labels.app\.kubernetes\.io/instance}' 2>/dev/null || true)
-  if [[ -n "$marks" ]]; then
-    warn "'$1' looks managed by ArgoCD/Helm: a manual change shows as OutOfSync and the next sync reverts it. Update the values in git too."
+  local ref app_ns app
+  ref=$(argocd_app_of "$1")
+  [[ -n "$ref" ]] || return 0
+  read -r app_ns app <<< "$ref"
+  if ! load_app "$app_ns" "$app"; then
+    warn "'$1' looks managed by ArgoCD/Helm ('$app'): a manual change shows as OutOfSync and the next sync reverts it. Update the values in git too."
+  elif [[ "$APP_STATE" == ON && "$APP_AUTO" == *'"selfHeal":true'* ]]; then
+    warn "'$1' is managed by ArgoCD app '$app' with autosync + selfHeal ON: ArgoCD reverts this change within seconds. Turn autosync off first: $SCRIPT_NAME autosync off -n $NAMESPACE -d $1"
+  elif [[ "$APP_STATE" == ON ]]; then
+    warn "'$1' is managed by ArgoCD app '$app' with autosync ON: the next git change reverts this change. Update the values in git too, or turn autosync off first."
+  else
+    warn "'$1' is managed by ArgoCD app '$app' (autosync OFF): it shows OutOfSync and the next manual sync reverts it. Update the values in git too."
   fi
+}
+
+# ---------------------------------------------------------------------------
+# ArgoCD autosync
+# ---------------------------------------------------------------------------
+# "app-namespace app" of the ArgoCD Application that manages a deployment, or nothing
+argocd_app_of() {  # argocd_app_of deploy
+  if [[ -n "$ARGOCD_APP" ]]; then printf '%s %s\n' "$ARGOCD_NAMESPACE" "$ARGOCD_APP"; return 0; fi
+  local marks tid inst helm app app_ns=$ARGOCD_NAMESPACE
+  marks=$(k -n "$NAMESPACE" get deploy "$1" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"|"}{.metadata.labels.argocd\.argoproj\.io/instance}{"|"}{.metadata.labels.app\.kubernetes\.io/instance}' 2>/dev/null) || return 0
+  IFS='|' read -r tid inst helm <<< "$marks" || true
+  # tracking-id is "<app>:<group>/<kind>:<namespace>/<name>"
+  if [[ -n "$tid" ]]; then app=${tid%%:*}
+  elif [[ -n "$inst" ]]; then app=$inst
+  else app=$helm
+  fi
+  [[ -n "$app" ]] || return 0
+  # Applications outside the ArgoCD namespace are tracked as "<namespace>_<app>"
+  if [[ "$app" == *_* ]]; then app_ns=${app%%_*}; app=${app#*_}; fi
+  printf '%s %s\n' "$app_ns" "$app"
+}
+
+autosync_state() {  # autosync_state automated-json: ON or OFF
+  if [[ -z "$1" || "$1" == *'"enabled":false'* ]]; then echo OFF; else echo ON; fi
+}
+
+flag_of() {  # flag_of automated-json field: yes, no or -
+  if [[ -z "$1" ]]; then echo -
+  elif [[ "$1" == *"\"$2\":true"* ]]; then echo yes
+  else echo no
+  fi
+}
+
+# Read an Application into APP_AUTO, APP_STATE, APP_SYNC, APP_HEALTH, APP_APPSET,
+# APP_PARENT and APP_BACKUP. Fails if it cannot be read. Only syncPolicy, status and
+# metadata are read: the spec can hold Helm values with secrets.
+load_app() {  # load_app app-namespace app
+  local info
+  APP_ERR=""
+  if ! info=$(ka -n "$1" get "$APP_RESOURCE" "$2" -o jsonpath='{.spec.syncPolicy.automated}{"|"}{.status.sync.status}{"|"}{.status.health.status}{"|"}{.metadata.ownerReferences[?(@.kind=="ApplicationSet")].name}{"|"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"|"}{.metadata.annotations.k8s-updater/autosync-backup}' 2>/dev/null); then
+    APP_ERR=$(ka -n "$1" get "$APP_RESOURCE" "$2" -o name 2>&1 | tail -1 || true)
+    return 1
+  fi
+  IFS='|' read -r APP_AUTO APP_SYNC APP_HEALTH APP_APPSET APP_PARENT APP_BACKUP <<< "$info" || true
+  APP_PARENT=${APP_PARENT%%:*}
+  APP_STATE=$(autosync_state "$APP_AUTO")
+}
+
+# Warn about controllers that put the syncPolicy back after a manual change
+autosync_notes() {  # autosync_notes app-namespace app  (after load_app)
+  local policy
+  if [[ -n "$APP_APPSET" ]]; then
+    policy=$(ka -n "$1" get applicationsets.argoproj.io "$APP_APPSET" -o jsonpath='{.spec.syncPolicy.applicationsSync}{"|"}{.spec.ignoreApplicationDifferences}' 2>/dev/null || true)
+    if [[ "$policy" == create-only* || "$policy" == create-delete* || "$policy" == *syncPolicy* ]]; then
+      info "'$2' is generated by ApplicationSet '$APP_APPSET', which keeps manual syncPolicy changes."
+    else
+      warn "'$2' is generated by ApplicationSet '$APP_APPSET'. Unless the ApplicationSet ignores syncPolicy differences, it puts the template's autosync back within seconds; then change it in the ApplicationSet template instead."
+    fi
+  fi
+  if [[ -n "$APP_PARENT" && "$APP_PARENT" != "$2" ]]; then
+    warn "'$2' is itself managed by ArgoCD app '$APP_PARENT' (app of apps). If that app has selfHeal, it reverts this change."
+  fi
+}
+
+# Kubeconfig cluster name of an ArgoCD destination, or the destination as ArgoCD names it
+dest_name() {  # dest_name destination-name destination-server
+  local name=$1 server=$2
+  if [[ -n "$name" ]]; then printf '%s' "$name"; return 0; fi
+  if [[ "$server" == https://kubernetes.default.svc* ]]; then printf 'in-cluster'; return 0; fi
+  name=$(kubectl config view -o jsonpath="{.clusters[?(@.cluster.server==\"$server\")].name}" 2>/dev/null | awk '{print $1}' || true)
+  printf '%s' "${name:-${server:--}}"
+}
+
+# "app|dest-namespace|dest-name|dest-server|ns/deploy ns/deploy ..." for every Application.
+# ArgoCD records the Deployments it manages in .status.resources, so this needs no access
+# to the workload cluster.
+list_apps() {
+  ka -n "$ARGOCD_NAMESPACE" get "$APP_RESOURCE" -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.destination.namespace}{"|"}{.spec.destination.name}{"|"}{.spec.destination.server}{"|"}{range .status.resources[?(@.kind=="Deployment")]}{.namespace}{"/"}{.name}{" "}{end}{"\n"}{end}'
+}
+
+# Print deployment -> Application -> autosync for NAMESPACE (or ARGOCD_APP). Collects the
+# Applications in AUTOSYNC_APPS and their destination clusters in AUTOSYNC_DESTS.
+autosync_report() {
+  local apps app dns dname dserver deploys dest hits item d key rows found="" notes=""
+  local wanted=" ${DEPLOYMENTS[*]+${DEPLOYMENTS[*]}} "
+  apps=$(list_apps 2>&1) || die "Cannot list $APP_RESOURCE in '$ARGOCD_NAMESPACE' on '$ARGOCD_CONTEXT': $apps"
+  rows="DEPLOYMENT|APP|DEST CLUSTER|AUTOSYNC|PRUNE|SELF-HEAL|SYNC|HEALTH"
+  AUTOSYNC_APPS=""; AUTOSYNC_DESTS=""
+  while IFS='|' read -r app dns dname dserver deploys; do
+    [[ -n "$app" ]] || continue
+    hits=""
+    if [[ -n "$ARGOCD_APP" ]]; then
+      [[ "$app" == "$ARGOCD_APP" ]] || continue
+      for item in $deploys; do hits="$hits ${item#*/}"; done
+    else
+      for item in $deploys; do
+        [[ "${item%%/*}" == "$NAMESPACE" ]] || continue
+        if [[ "$wanted" == "  " ]] || contains_word "$wanted" "${item#*/}"; then hits="$hits ${item#*/}"; fi
+      done
+      if [[ -z "$hits" && "$wanted" == "  " && "$dns" == "$NAMESPACE" ]]; then hits="-"; fi
+    fi
+    [[ -n "$hits" ]] || continue
+    dest=$(dest_name "$dname" "$dserver")
+    key="$ARGOCD_NAMESPACE/$app"
+    if ! load_app "$ARGOCD_NAMESPACE" "$app"; then
+      notes="$notes"$'\n'"Cannot read Application '$app': ${APP_ERR:-unknown error}"
+      continue
+    fi
+    for d in $hits; do
+      rows="$rows"$'\n'"$d|$app|$dest|$APP_STATE|$(flag_of "$APP_AUTO" prune)|$(flag_of "$APP_AUTO" selfHeal)|${APP_SYNC:--}|${APP_HEALTH:--}"
+      found="$found $d"
+    done
+    AUTOSYNC_APPS="$AUTOSYNC_APPS $key"
+    AUTOSYNC_DESTS="$AUTOSYNC_DESTS $key=$dest"
+  done <<< "$apps"
+  for d in $wanted; do
+    contains_word "$found" "$d" || rows="$rows"$'\n'"$d|-|-|not-argocd|-|-|-|-"
+  done
+  if [[ -n "$ARGOCD_APP" && -z "$AUTOSYNC_APPS" && -z "$notes" ]]; then
+    notes=$'\n'"No Application '$ARGOCD_APP' in '$ARGOCD_NAMESPACE' on '$ARGOCD_CONTEXT'."
+  fi
+  if [[ "$rows" == *$'\n'* ]]; then
+    log_block "$(printf '%s\n' "$rows" | column -t -s '|')"
+  else
+    warn "No ArgoCD Application deploys to namespace '$NAMESPACE'."
+  fi
+  while IFS= read -r d; do
+    if [[ -n "$d" ]]; then warn "$d"; fi
+  done <<< "$notes"
+}
+
+pick_app() {  # interactive: narrow AUTOSYNC_APPS to one Application, or keep all
+  local apps=() key choice
+  for key in $AUTOSYNC_APPS; do apps+=("$key"); done
+  [[ ${#apps[@]} -gt 1 ]] || return 0
+  echo "Applications:"
+  PS3="Choose a number: "
+  select choice in "ALL listed applications" "${apps[@]}"; do
+    if [[ "$REPLY" == 1 ]]; then break
+    elif [[ -n "$choice" ]]; then AUTOSYNC_APPS=" $choice"; break
+    fi
+    echo "Invalid choice."
+  done
+}
+
+# Merge patch for one Application (after load_app). "off" saves the automated settings
+# (prune, selfHeal, ...) in an annotation so "on" can restore them.
+autosync_patch() {  # autosync_patch on|off
+  local esc
+  if [[ "$1" == off ]]; then
+    esc=${APP_AUTO//\\/\\\\}
+    esc=${esc//\"/\\\"}
+    printf '{"metadata":{"annotations":{"%s":"%s"}},"spec":{"syncPolicy":{"automated":null}}}' "$BACKUP_KEY" "$esc"
+  elif [[ "$APP_AUTO" == *'"enabled":false'* ]]; then
+    printf '{"spec":{"syncPolicy":{"automated":{"enabled":true}}}}'
+  elif [[ "$APP_BACKUP" =~ ^\{[^{}]*\}$ ]]; then
+    printf '{"metadata":{"annotations":{"%s":null}},"spec":{"syncPolicy":{"automated":%s}}}' "$BACKUP_KEY" "$APP_BACKUP"
+  else
+    printf '{"spec":{"syncPolicy":{"automated":{}}}}'
+  fi
+}
+
+autosync_snapshot() {  # autosync_snapshot before|after app-namespace/app...
+  local phase=$1 key; shift
+  : > "$RUN_DIR/$phase.txt"
+  for key in "$@"; do
+    ka -n "${key%%/*}" get "$APP_RESOURCE" "${key#*/}" -o jsonpath='{.metadata.name}{"  automated="}{.spec.syncPolicy.automated}{"  sync="}{.status.sync.status}{"  health="}{.status.health.status}{"\n"}' >> "$RUN_DIR/$phase.txt" 2>&1 || true
+  done
+}
+
+# Re-read the Application for a while: an ApplicationSet or a parent app may undo the toggle
+verify_autosync() {  # verify_autosync app-namespace app ON|OFF
+  local i
+  info "Watching '$2' for ${AUTOSYNC_VERIFY_SECONDS}s to make sure nothing reverts it"
+  for (( i = 1; i <= AUTOSYNC_VERIFY_SECONDS; i++ )); do
+    sleep 1
+    if ! load_app "$1" "$2"; then printf '\n'; error "Cannot read '$2' any more."; return 1; fi
+    if [[ "$APP_STATE" != "$3" ]]; then
+      printf '\n'
+      error "'$2' autosync is back to $APP_STATE. Something reverted it (ApplicationSet '${APP_APPSET:-none}' or a parent app); change it in git instead."
+      return 1
+    fi
+    draw_bar $(( i * 100 / AUTOSYNC_VERIFY_SECONDS )) "autosync $APP_STATE"
+  done
+  printf '\n'
+  ok "'$2' autosync is $3 (sync: ${APP_SYNC:-?}, health: ${APP_HEALTH:-?})"
+}
+
+autosync_change() {  # autosync_change on|off  (Applications from AUTOSYNC_APPS)
+  local action=$1 want key app_ns app plan_text="" changes="" failed=0 item dests=""
+  want=$(printf '%s' "$action" | tr '[:lower:]' '[:upper:]')
+  # One ArgoCD can serve staging and production with the same namespace names
+  for key in $AUTOSYNC_APPS; do
+    for item in $AUTOSYNC_DESTS; do
+      if [[ "${item%%=*}" == "$key" ]] && ! contains_word "$dests" "${item#*=}"; then dests="$dests ${item#*=}"; fi
+    done
+  done
+  if [[ $(printf '%s' "$dests" | wc -w) -gt 1 ]]; then
+    die "The selected Applications deploy to several clusters ($dests ). Pick one with --app or -d."
+  fi
+  # A production destination needs the stricter confirmation, whatever the ArgoCD context
+  for item in $dests $AUTOSYNC_APPS; do
+    if printf '%s' "${item#*/}" | grep -Eqi "$PROD_CONTEXT_PATTERN"; then IS_PROD=1; fi
+  done
+  start_run_log "autosync-$action"
+  section "Plan"
+  for key in $AUTOSYNC_APPS; do
+    load_app "${key%%/*}" "${key#*/}" || die "Cannot read Application '$key' on '$ARGOCD_CONTEXT'."
+    if [[ "$APP_STATE" == "$want" ]]; then
+      plan_text="$plan_text  $key : autosync already $want (skip)"$'\n'
+    else
+      plan_text="$plan_text  $key : autosync $APP_STATE -> $want"$'\n'
+      changes="$changes $key"
+    fi
+  done
+  info "Destination cluster:$dests"
+  log_block "${plan_text%$'\n'}"
+  printf '%s' "$plan_text" > "$RUN_DIR/plan.txt"
+  if [[ -z "$changes" ]]; then ok "Nothing to change."; return 0; fi
+
+  for key in $changes; do
+    app_ns=${key%%/*}; app=${key#*/}
+    load_app "$app_ns" "$app" || die "Cannot read Application '$key'."
+    autosync_notes "$app_ns" "$app"
+    if [[ "$(ka -n "$app_ns" auth can-i patch "$APP_RESOURCE" 2>/dev/null || true)" != yes ]]; then
+      die "You are not allowed to patch $APP_RESOURCE in '$app_ns' on '$ARGOCD_CONTEXT'."
+    fi
+    if [[ "$want" == ON ]]; then
+      if [[ -n "$APP_SYNC" && "$APP_SYNC" != Synced ]]; then
+        warn "'$app' is $APP_SYNC: turning autosync on syncs it right away and reverts manual changes that are not in git (for example a set-image)."
+      fi
+      if [[ "$APP_AUTO" != *'"enabled":false'* && ! "$APP_BACKUP" =~ ^\{[^{}]*\}$ ]]; then
+        warn "'$app' has no settings saved by an earlier 'autosync off'; it is enabled with ArgoCD defaults (prune: no, selfHeal: no)."
+      fi
+    fi
+  done
+  ok "Allowed to patch $APP_RESOURCE"
+
+  # shellcheck disable=SC2086
+  autosync_snapshot before $changes
+  if [[ $DRY_RUN -eq 1 ]]; then
+    section "Dry run (server-side validation, nothing is saved)"
+  else
+    confirm "Turn autosync $want for$changes on '$ARGOCD_CONTEXT'?" "${NAMESPACE:-$ARGOCD_APP}" || return 1
+    section "Apply"
+  fi
+  for key in $changes; do
+    app_ns=${key%%/*}; app=${key#*/}
+    load_app "$app_ns" "$app" || die "Cannot read Application '$key'."
+    ka_change -n "$app_ns" patch "$APP_RESOURCE" "$app" --type merge -p "$(autosync_patch "$action")" || failed=1
+  done
+  if [[ $failed -eq 1 ]]; then die "kubectl patch failed (see above). Check $RUN_DIR."; fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    ok "Dry run passed. Run again without --dry-run to apply."
+    return 0
+  fi
+
+  section "Verify"
+  for key in $changes; do
+    verify_autosync "${key%%/*}" "${key#*/}" "$want" || failed=1
+  done
+  # shellcheck disable=SC2086
+  autosync_snapshot after $changes
+  finish "$failed"
 }
 
 # ---------------------------------------------------------------------------
@@ -571,6 +874,38 @@ cmd_restart() {
   finish "$rollout_failed"
 }
 
+# autosync only talks to the cluster running ArgoCD, so it works when the workload
+# cluster is behind another VPN. -n is the namespace the deployments run in.
+cmd_autosync() {
+  local action=${AUTOSYNC_ACTION:-status}
+  case "$action" in
+    status|on|off) ;;
+    *) die "Unknown autosync action '$action'. Use status, on or off." ;;
+  esac
+  if [[ -n "$ARGOCD_CONTEXT" ]]; then KUBE_CONTEXT=$ARGOCD_CONTEXT; fi
+  resolve_context
+  check_session
+  if [[ -z "$ARGOCD_APP" && -z "$NAMESPACE" ]]; then
+    can_prompt || die "No namespace. Pass -n/--namespace (where the deployments run) or --app NAME."
+    read -r -p "Namespace the deployments run in: " NAMESPACE
+    [[ -n "$NAMESPACE" ]] || die "Namespace is required."
+  fi
+
+  section "ArgoCD autosync"
+  info "ArgoCD namespace: $ARGOCD_NAMESPACE"
+  if ! ka api-resources --api-group=argoproj.io -o name 2>/dev/null | grep -x "$APP_RESOURCE" >/dev/null; then
+    die "No ArgoCD Applications on '$ARGOCD_CONTEXT': ArgoCD runs in another cluster. Pass --argocd-context CTX or -c CTX (see 'kubectl config get-contexts -o name')."
+  fi
+  autosync_report
+  if [[ "$action" == status ]]; then return 0; fi
+  [[ -n "$AUTOSYNC_APPS" ]] || die "No readable ArgoCD Application matches the selection."
+  if [[ $ALL -eq 0 && ${#DEPLOYMENTS[@]} -eq 0 && -z "$ARGOCD_APP" && $(printf '%s' "$AUTOSYNC_APPS" | wc -w) -gt 1 ]]; then
+    can_prompt || die "Several Applications match. Choose with -d NAME, --app NAME or --all."
+    pick_app
+  fi
+  autosync_change "$action"
+}
+
 finish() {
   section "Result"
   if [[ "$1" -eq 0 ]]; then
@@ -596,6 +931,21 @@ menu_choose_namespace() {
   fi
 }
 
+menu_autosync() {
+  local choice
+  AUTOSYNC_ACTION=status
+  cmd_autosync
+  [[ -n "$AUTOSYNC_APPS" ]] || return 0
+  echo "  1) Turn autosync OFF"
+  echo "  2) Turn autosync ON"
+  echo "  b) Back"
+  read -r -p "> " choice || return 0
+  case "$choice" in
+    1) pick_app; autosync_change off ;;
+    2) pick_app; autosync_change on ;;
+  esac
+}
+
 cmd_menu() {
   INTERACTIVE=1
   resolve_context
@@ -608,7 +958,8 @@ cmd_menu() {
     echo "  3) Show deployments and images"
     echo "  4) Update image"
     echo "  5) Restart deployment(s)"
-    echo "  6) Toggle dry run (now: $([[ $DRY_RUN -eq 1 ]] && echo ON || echo OFF))"
+    echo "  6) ArgoCD autosync (check / on / off)"
+    echo "  7) Toggle dry run (now: $([[ $DRY_RUN -eq 1 ]] && echo ON || echo OFF))"
     echo "  q) Quit"
     read -r -p "> " choice || break
     # Actions 3-5 need a namespace; it is remembered for the next actions
@@ -622,7 +973,8 @@ cmd_menu() {
       3) ( cmd_status ) || true ;;
       4) ( DEPLOYMENTS=(); ALL=0; TARGET_IMAGE=""; cmd_set_image ) || true ;;
       5) ( DEPLOYMENTS=(); ALL=0; cmd_restart ) || true ;;
-      6) DRY_RUN=$(( 1 - DRY_RUN )) ;;
+      6) ( DEPLOYMENTS=(); ALL=0; menu_autosync ) || true ;;  # uses ARGOCD_CONTEXT if set
+      7) DRY_RUN=$(( 1 - DRY_RUN )) ;;
       q|Q) break ;;
       *) echo "Unknown choice." ;;
     esac
@@ -636,6 +988,7 @@ need_value() { [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "Option $1 needs a
 
 parse_args() {
   if [[ $# -gt 0 && "$1" != -* ]]; then COMMAND=$1; shift; fi
+  if [[ "$COMMAND" == autosync && $# -gt 0 && "$1" != -* ]]; then AUTOSYNC_ACTION=$1; shift; fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -c|--context)    need_value "$@"; KUBE_CONTEXT=$2; shift 2 ;;
@@ -648,11 +1001,15 @@ parse_args() {
       -y|--yes)        ASSUME_YES=1; shift ;;
       --timeout)       need_value "$@"; ROLLOUT_TIMEOUT=$2; shift 2 ;;
       --log-dir)       need_value "$@"; LOG_ROOT=$2; shift 2 ;;
+      --argocd-context)   need_value "$@"; ARGOCD_CONTEXT=$2; shift 2 ;;
+      --argocd-namespace) need_value "$@"; ARGOCD_NAMESPACE=$2; shift 2 ;;
+      --app)           need_value "$@"; ARGOCD_APP=$2; shift 2 ;;
       -h|--help)       usage; exit 0 ;;
       *) die "Unknown option '$1'. See --help." ;;
     esac
   done
   [[ "$ROLLOUT_TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds."
+  [[ "$AUTOSYNC_VERIFY_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "AUTOSYNC_VERIFY_SECONDS must be a positive number."
   if [[ $ALL -eq 1 && ${#DEPLOYMENTS[@]} -gt 0 ]]; then die "Use either -d or --all, not both."; fi
 }
 
@@ -663,6 +1020,7 @@ main() {
     status)    cmd_status ;;
     set-image) cmd_set_image ;;
     restart)   cmd_restart ;;
+    autosync)  cmd_autosync ;;
     menu)      cmd_menu ;;
     help)      usage ;;
     *) die "Unknown command '$COMMAND'. See --help." ;;
